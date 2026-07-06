@@ -16,6 +16,7 @@ LICENSE text eol=lf
 *.h text eol=lf
 *.ino text eol=lf
 *.ld text eol=lf
+*.xpr text eol=lf
 Makefile text eol=lf
 
 *.pdf binary
