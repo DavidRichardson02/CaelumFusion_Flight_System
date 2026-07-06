@@ -33,6 +33,30 @@ compile focused RTL files, but the project file itself should be opened and
 validated with a version that understands the current `.xpr` metadata before
 making project-level synthesis or timing claims.
 
+## Hardware Interface Contract
+
+The board-level contract is defined by `caelumfusion_top_vga.v` and
+`Basys-3-Master.xdc`. Treat the XDC as the electrical source of truth before
+moving jumpers or applying external power.
+
+| Interface | RTL ports | Basys 3 mapping | Current role |
+| --- | --- | --- | --- |
+| SYS clock and reset | `clk`, `rst` | 100 MHz clock on W5, BTNC reset on U18 | System clock source and global reset. |
+| VGA | `vga_rgb[11:0]`, `vga_hsync`, `vga_vsync` | Basys 3 VGA pins, HSYNC P19, VSYNC R19 | Canonical 640 x 480 display output. |
+| JA shared I2C | `scl`, `sda` | JA3/J2 SCL, JA4/G2 SDA, LVCMOS33 pullups | BMP/LIS3DH/CMPS2/MMC3416/PMON1/LIS2MDL-style evidence bus. |
+| JB SPI / ACL2 | `adxl362_cs_n`, `adxl362_mosi`, `adxl362_miso`, `adxl362_sclk`, `adxl362_int1`, `adxl362_int2` | JB pins A14/A16/B15/B16/A17/A15 | ADXL362/Pmod ACL2 SPI evidence path and interrupt inputs. |
+| JC GPIO / DPOT | `ls1_s_raw[3:0]`, `pir_motion_raw`, `dpot_cs_n`, `dpot_mosi`, `dpot_sclk` | JC pins K17/M18/N17/P18/L17/M19/P17/R18 | Light, PIR, and reserved digital-potentiometer bench signals. |
+| JXADC UART bridge | `teensy_uart_rx_raw`, `teensy_uart_tx` | JXADC XA1_P/J3 input, XA2_P/L3 optional output | 3.3 V external MCU fixed-packet ingress. The active producer example is EK-TM4C123GXL UART1. |
+| CLS UART | `cls_tx` | A18, LVCMOS33 | Current canonical top holds this line idle high; CLS modules exist but are not active in `caelumfusion_top_vga`. |
+
+The JXADC bridge is a 3.3 V logic interface. Do not connect 5 V UART signaling
+to the FPGA input. In the TM4C producer wiring, PC5/U1TX/J4.05 is the expected
+MCU-to-FPGA transmit source for `teensy_uart_rx_raw`; PC4/U1RX is optional for a
+future FPGA-to-MCU return path.
+
+Pmod VCC and GND pins are board power rails, not FPGA I/O. Connector diagrams
+and bench notes should keep power, ground, and constrained signal pins separate.
+
 ## What This Repository Contains
 
 This repository tracks hand-authored project inputs:
@@ -62,18 +86,23 @@ flowchart LR
         Switches["Switches and Buttons"]
         VGA["VGA Connector"]
         JA["JA Shared I2C Header"]
-        JB["JB SPI / GPIO Header"]
+        JB["JB SPI Header"]
+        JC["JC GPIO / DPOT Header"]
         JXADC["JXADC UART Bridge Pins"]
+        CLS["CLS UART Pin"]
     end
 
     subgraph Top["caelumfusion_top_vga"]
         Sync["3-FF Control Synchronizers"]
         I2C["rocket_i2c_suite_top"]
         SPI["rocket_spi_suite_top"]
+        GPIO["pmod_gpio_capture"]
         UART["teensy_uart_range_bridge"]
         BenchMag["mag1_bench_snapshot_source"]
         Faults["snapshot_fault_injector"]
         Extension["sensor_extension_hub"]
+        Blackbox["blackbox_frame_packer"]
+        CLSIdle["CLS TX idle-high assignment"]
         RenderCtl["caelumfusion_vga_render_control"]
         Science["caelumfusion_science_page_vga"]
         Compass["planar_compass_truth_page_vga"]
@@ -88,12 +117,16 @@ flowchart LR
     Sync --> Faults
     JA <--> I2C
     JB <--> SPI
+    JC --> GPIO
     JXADC --> UART
+    CLSIdle --> CLS
     I2C --> Extension
     SPI --> Extension
+    GPIO --> Extension
     UART --> Extension
     BenchMag --> Extension
     Faults --> Extension
+    Extension --> Blackbox
     Extension --> RenderCtl
     RenderCtl --> Viz
     RenderCtl --> Compass
@@ -101,6 +134,61 @@ flowchart LR
     Viz --> VGA
     Compass --> VGA
     Science --> VGA
+```
+
+### Canonical Module Hierarchy
+
+The project is intentionally organized around a board-facing integration top.
+Lower modules produce evidence records; they do not directly own display policy
+or silently convert missing data into good data.
+
+```mermaid
+flowchart TB
+    Top["caelumfusion_top_vga"]
+
+    subgraph Inputs["SYS-domain producers"]
+        I2CSuite["rocket_i2c_suite_top"]
+        SPISuite["rocket_spi_suite_top"]
+        GPIOCap["pmod_gpio_capture"]
+        UARTBridge["teensy_uart_range_bridge"]
+        BenchMag["mag1_bench_snapshot_source"]
+        FaultInject["snapshot_fault_injector"]
+        NavWind["landing_nav_wind_observer"]
+    end
+
+    subgraph Evidence["Evidence aggregation"]
+        ExtHub["sensor_extension_hub"]
+        Blackbox["blackbox_frame_packer"]
+        RawSnap["raw and derived snapshot buses"]
+    end
+
+    subgraph Render["PIX-domain render path"]
+        RenderCtl["caelumfusion_vga_render_control"]
+        MainHud["flight_visualizer_pix"]
+        Compass["planar_compass_truth_page_vga"]
+        Science["caelumfusion_science_page_vga"]
+    end
+
+    Top --> I2CSuite
+    Top --> SPISuite
+    Top --> GPIOCap
+    Top --> UARTBridge
+    Top --> BenchMag
+    Top --> FaultInject
+    Top --> NavWind
+    I2CSuite --> RawSnap
+    SPISuite --> RawSnap
+    GPIOCap --> ExtHub
+    UARTBridge --> ExtHub
+    BenchMag --> ExtHub
+    FaultInject --> ExtHub
+    RawSnap --> ExtHub
+    ExtHub --> Blackbox
+    ExtHub --> RenderCtl
+    NavWind --> RenderCtl
+    RenderCtl --> MainHud
+    RenderCtl --> Compass
+    RenderCtl --> Science
 ```
 
 ### Evidence Pipeline
@@ -148,6 +236,16 @@ flowchart TB
     Hub --> Pages
     Blackbox --> Host
 ```
+
+| Field | Contract |
+| --- | --- |
+| `valid` | Payload is currently meaningful for the producer contract. |
+| `status` | Encoded reason for OK, missing, stale, timeout, NACK, ID mismatch, config error, or other failure state. |
+| `seq` | Producer update sequence used to detect refresh and alignment behavior. |
+| `age` | Freshness counter; saturated or stale age must remain visible to consumers. |
+| `payload` | Sensor or derived data value with path-specific scaling and units. |
+| `source_flags` | Provenance bits for real, bridge, replayed, or synthetic evidence. |
+| `fault_flags` | Aggregated disagreement, stale, raw-status, diagnostic, or logging fault indicators. |
 
 ### Clocking And CDC Model
 
@@ -219,6 +317,10 @@ flowchart LR
 |   |   |-- caelumfusion_science_page_vga.v
 |   |   |-- planar_compass_truth_page_vga.v
 |   |   |-- flight_visualizer_pix.v
+|   |   |-- pmod_gpio_capture.v
+|   |   |-- blackbox_frame_packer.v
+|   |   |-- teensy_bridge_packet_ingress.v
+|   |   |-- teensy_uart_range_bridge.v
 |   |   `-- telemetry_defs_vh.vh
 |   `-- sim_1/new/
 |       |-- tb_i2c_suite_regression_all3_real_engine.v
@@ -318,6 +420,19 @@ The SPI suite supports accelerometer and related sensor jobs through explicit
 mode-0 style engines and job arbitration. SPI paths are selected through the
 compiled top-level build and runtime switch gates.
 
+### GPIO And CLS UART
+
+`pmod_gpio_capture.v` samples the JC light-sensor and PIR inputs and publishes
+them as extension evidence with validity, age, source, and payload fields. This
+keeps bench GPIO observations inside the same status/freshness model as the
+sensor buses.
+
+The repository also contains minimal CLS UART formatter, scheduler, refresh, and
+9600-baud transmitter modules. In the canonical `caelumfusion_top_vga` build,
+however, `cls_tx` is assigned idle high. Treat the CLS sources as available
+implementation scaffolding, not as active hardware behavior, until the top-level
+contract is intentionally changed and verified.
+
 ### External MCU UART Bridge
 
 The external-MCU bridge keeps the historical `teensy_*` RTL names, but the
@@ -332,6 +447,12 @@ The first implemented packet target is range/AGL evidence. The bridge remains
 default-off unless `USE_TEENSY_UART_RANGE_BRIDGE` is enabled and SW15 gates the
 accepted packets.
 
+The fixed-packet ingress uses sync word `16'hA55A`, packet types `8'h50`
+heartbeat and `8'h51` range/AGL, sequence and timestamp fields, flags, payload,
+auxiliary words, and checksum/error counters. The RTL should report malformed,
+unsupported, stale, or missing heartbeat conditions through status and diagnostic
+counters instead of inventing usable range evidence.
+
 ### MAG1 Provenance
 
 MAG1 has two deliberately separated producers:
@@ -343,12 +464,36 @@ MAG1 has two deliberately separated producers:
 Neither path changes `der_heading_mdeg`. The live heading remains MAG0 planar
 `atan2(MY, MX)` until a separate fusion and tilt-compensation contract exists.
 
+### Black-Box Frame Boundary
+
+`blackbox_frame_packer.v` is a storage-agnostic ready/valid stream boundary. It
+packs a versioned sequence of 32-bit words from raw snapshots and extension
+metadata, including validity, status, age, source flags, sequence fields, and
+MAG/range diagnostic context. It does not own an SD card, filesystem, or host
+transport. A release should therefore cite both the frame-packer contract and
+the downstream storage/decoder that actually captured the frame.
+
 ## VGA View Model
 
 The render-control layer chooses among the main HUD, compass evidence, self-test
 view, sensor diagnostics, and science pages. The important design rule is that
 the view is an engineering instrument: stale, invalid, synthetic, and missing
 data must remain visually distinguishable from live validated evidence.
+
+| View ID | View | Notes |
+| --- | --- | --- |
+| 0 | Flight HUD | Main avionics instrumentation view. |
+| 1 | Compass truth | MAG0/MAG1 evidence and heading-health visualization. |
+| 2 | Self-test HUD | Deliberate self-test and diagnostic stimulus visibility. |
+| 3 | Sensor diagnostics | Status, source, freshness, and fault detail. |
+| 4 | Science explain | Compact explanatory science page. |
+| 5 | Science wind | Wind/nav scaffold visibility; missing inputs remain explicit. |
+| 6 | Science integrity | Extension metadata and integrity visualization. |
+
+`caelumfusion_vga_render_control.v` arbitrates page requests, encoded direct
+selection, compass hold behavior, and invalid-view reporting. Unsupported view
+IDs should be rejected or made visible as configuration faults rather than
+silently falling through to unrelated pages.
 
 ```mermaid
 stateDiagram-v2
@@ -363,6 +508,23 @@ stateDiagram-v2
     SelfTestHUD --> SensorDiag: SW2 + SW6 fault injection
     SensorDiag --> FlightHUD: clear diagnostic mode
 ```
+
+## Host-Side Analysis Tools
+
+Host scripts under `tools/analysis/` support design review and regression
+analysis, but they are not synthesizable RTL and they do not prove live
+navigation or wind binding by themselves.
+
+| Tool | Boundary |
+| --- | --- |
+| `tools/analysis/landing_dispersion_envelope.py` | Computes and reports a host-side landing-dispersion envelope from supplied data or fixtures. |
+| `tools/analysis/export_landing_telemetry_csv.py` | Exports analysis-oriented CSV data for review. |
+| `tools/analysis/run_landing_dispersion_regression.py` | Runs host regression checks for the landing-dispersion analysis path. |
+
+Keep host-derived diagnostics distinct from FPGA evidence fields. When nav,
+GNSS, wind, or landing estimates are not wired to real snapshot producers, the
+FPGA-side renderer should continue to show missing-input or invalid status
+rather than borrowing host-analysis outputs as live truth.
 
 ## Verification Strategy
 
@@ -498,6 +660,7 @@ python tools\decode_waveforms_i2c.py `
 | `docs/CaelumFusion_Extension_Milestones.md` | Implemented extension evidence, MAG1, range, GNSS, black-box, and limitations. |
 | `docs/CaelumFusion_TM4C123GXL_UART_Bridge_Bringup.md` | TM4C123GXL external bridge bring-up. |
 | `docs/CaelumFusion_Teensy_UART_Bridge_Bringup.md` | Historical Teensy bridge bring-up context. |
+| `firmware/tm4c123gxl_bridge_range_producer/README.md` | Active EK-TM4C123GXL fixed-packet range producer firmware boundary. |
 | `docs/CaelumFusion_Landing_Dispersion_Envelope.md` | Host analysis and landing-dispersion tooling. |
 | `docs/CaelumFusion_L1_Avionics_Release_Checklist.md` | Release gate checklist for flight-image evidence. |
 | `docs/bench_captures/index.md` | Bench-capture inventory and evidence status. |
@@ -549,6 +712,9 @@ commit and matching Vivado version.
 | Navigation/wind binding | Nav/wind fields are guarded until real estimator sources are wired. Do not infer wind or navigation truth from unrelated raw evidence. |
 | Freshness/stale data | Every consumer should preserve age/status semantics rather than silently reusing stale-good payloads. |
 | Project file-set drift | New files must be registered in the `.xpr`; disabled project entries can break project-mode builds even when files exist on disk. |
+| CLS activation ambiguity | CLS helper modules are present, but `caelumfusion_top_vga` currently drives `cls_tx` idle high. Do not describe CLS output as active without a top-level change and bench evidence. |
+| External bridge enablement | The TM4C producer and UART ingress are available, but the FPGA bridge path is default-off through `USE_TEENSY_UART_RANGE_BRIDGE` and SW15. Validate standalone TM4C frames before wiring JXADC. |
+| Host-analysis boundary | Landing-dispersion scripts are host diagnostics. They should not be cited as live FPGA nav/wind evidence unless real snapshot producers are wired and verified. |
 
 ## Development Workflow
 
@@ -575,3 +741,9 @@ commit and matching Vivado version.
    update the release checklist with current commit-specific evidence.
 5. Add a lightweight documentation CI check for Markdown links and Mermaid fence
    integrity once the repository hosting workflow is settled.
+6. Run standalone TM4C UART frame validation before enabling the JXADC bridge in
+   a Basys 3 build.
+7. Decide whether CLS should remain idle or become an active top-level output,
+   then verify that decision with a focused bench and hardware capture.
+8. Add or document a concrete black-box frame consumer before making storage or
+   post-flight replay claims.
