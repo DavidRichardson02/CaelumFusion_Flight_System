@@ -966,7 +966,7 @@ commit and matching Vivado version.
    change.
 9. Commit source changes and exclude generated Vivado outputs.
 
-## Recommended Next Engineering Steps
+## Next Engineering Steps
 
 1. Version-normalize the Vivado project flow: choose whether the active project
    is 2025.1.1 or needs a 2023.2-compatible project copy.
